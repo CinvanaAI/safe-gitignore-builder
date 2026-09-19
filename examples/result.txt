@@ -1,0 +1,6 @@
+{
+  "initial_rules": "# Ignore everything by default\n/*\n",
+  "reviewed_rules": "# Ignore everything by default\n/*\n\n# Keep\n!/src/\n!/src/tool.py\n\n# Re-ignore inside kept locations\n/src/notes.txt\n",
+  "review_survives_rescan": true,
+  "target_unchanged": true
+}
