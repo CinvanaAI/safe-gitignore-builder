@@ -1,7 +1,5 @@
 # Safe Gitignore Builder
 
-Review what may be exposed, starting from an ignore-everything candidate.
-
 Review a messy source tree and generate an allowlist-style ignore candidate that exposes only explicitly approved files.
 
 ## See it work

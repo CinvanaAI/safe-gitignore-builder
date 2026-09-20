@@ -27,6 +27,17 @@ def should_skip(path: Path, skip_dirs: set[str]) -> bool:
     return any(part in skip_dirs for part in path.parts)
 
 
+def _validate_inventory_path(relative: str) -> None:
+    # The persistent text format reserves !/, # and /**. Never interpret a
+    # filesystem name as a stored approval, comment or recursive declaration.
+    if any(
+        part.startswith(("!", "#")) or part == "**" or part != part.strip()
+        or "\\" in part or any(ord(char) < 32 for char in part)
+        for part in relative.split("/")
+    ):
+        raise ValueError(f"Unsupported path name for review inventory: {relative!r}")
+
+
 def scan_repo_tree(repo_root: Path, skip_dirs: set[str] | None = None) -> list[str]:
     skip_dirs = skip_dirs or {".git", "__pycache__"}
 
@@ -37,6 +48,7 @@ def scan_repo_tree(repo_root: Path, skip_dirs: set[str] | None = None) -> list[s
             continue
 
         relative_path = path.relative_to(repo_root).as_posix()
+        _validate_inventory_path(relative_path)
 
         if path.is_dir():
             lines.append(f"{relative_path}/")
@@ -314,7 +326,8 @@ class TreeVerificationWorkflow:
             total_count = len(descendant_files)
 
             folder.opened = safe_count > 0
-            folder.fully_safe = safe_count == total_count
+            # Reviewing today's files never authorizes tomorrow's siblings.
+            folder.fully_safe = False
 
         for folder_path in folder_paths:
             folder = self.folders[folder_path]
@@ -330,132 +343,29 @@ class TreeVerificationWorkflow:
         return [path for path in self.files if path.startswith(prefix)]
 
     def compile_gitignore_lines(self) -> list[str]:
-        lines: List[str] = []
-        lines.append("# Ignore everything by default")
-        lines.append("/*")
-        lines.append("")
+        # Git rules are ordered: open an ancestor, deny its children, then
+        # reopen only reviewed descendants. Each path must be a literal.
+        def literal(path: str) -> str:
+            return ''.join('\\' + char if char in '\\*?[] ' else char for char in path)
 
-        keep_lines: List[str] = []
-        reignore_lines: List[str] = []
-
-        emitted_keep: Set[str] = set()
-        emitted_reignore: Set[str] = set()
-
-        top_level_folders = sorted(
-            [path for path in self.folders if self.parent_folder(path) is None],
-            key=lambda p: p.lower(),
-        )
-
-        for folder_path in top_level_folders:
-            self.emit_folder_keep_rules(folder_path, keep_lines, emitted_keep)
-
-        safe_root_files = sorted(
-            [
-                file_path
-                for file_path, file_node in self.files.items()
-                if file_node.safe and self.parent_folder(file_path) is None
-            ],
-            key=lambda p: p.lower(),
-        )
-
-        if keep_lines:
-            lines.append("# Keep")
-            lines.extend(keep_lines)
-            lines.append("")
-
-        if safe_root_files:
-            lines.append("# Keep safe root files")
-            for file_path in safe_root_files:
-                rule = f"!/{file_path}"
-                if rule not in emitted_keep:
-                    lines.append(rule)
-                    emitted_keep.add(rule)
-            lines.append("")
-
-        for folder_path in top_level_folders:
-            self.emit_folder_reignore_rules(folder_path, reignore_lines, emitted_reignore)
-
-        if reignore_lines:
-            lines.append("# Re-ignore inside kept locations")
-            lines.extend(reignore_lines)
-            lines.append("")
-
-        return trim_trailing_blank_lines(lines)
-
-    def emit_folder_keep_rules(self, folder_path: str, lines: List[str], emitted: Set[str]) -> None:
-        folder = self.folders[folder_path]
-        if not folder.opened:
-            return
-
-        if folder.fully_safe:
-            open_rule = f"!/{folder_path}/"
-            all_rule = f"!/{folder_path}/**"
-
-            if open_rule not in emitted:
-                lines.append(open_rule)
-                emitted.add(open_rule)
-            if all_rule not in emitted:
-                lines.append(all_rule)
-                emitted.add(all_rule)
-            return
-
-        open_rule = f"!/{folder_path}/"
-        if open_rule not in emitted:
-            lines.append(open_rule)
-            emitted.add(open_rule)
-
-        direct_safe_files = sorted(
-            [p for p in folder.child_files if self.files[p].safe],
-            key=lambda p: p.lower(),
-        )
-        for file_path in direct_safe_files:
-            rule = f"!/{file_path}"
-            if rule not in emitted:
-                lines.append(rule)
-                emitted.add(rule)
-
-        direct_child_folders = sorted(folder.child_folders, key=lambda p: p.lower())
-        for child_folder in direct_child_folders:
-            self.emit_folder_keep_rules(child_folder, lines, emitted)
-
-    def emit_folder_reignore_rules(self, folder_path: str, lines: List[str], emitted: Set[str]) -> None:
-        folder = self.folders[folder_path]
-        if not folder.opened:
-            return
-
-        if folder.fully_safe:
-            return
-
-        direct_unsafe_files = sorted(
-            [p for p in folder.child_files if not self.files[p].safe],
-            key=lambda p: p.lower(),
-        )
-        for file_path in direct_unsafe_files:
-            rule = f"/{file_path}"
-            if rule not in emitted:
-                lines.append(rule)
-                emitted.add(rule)
-
-        direct_child_folders = sorted(folder.child_folders, key=lambda p: p.lower())
-        for child_folder_path in direct_child_folders:
-            child_folder = self.folders[child_folder_path]
-
-            if child_folder.fully_safe:
-                continue
-
-            if not child_folder.opened:
-                open_rule = f"/{child_folder_path}/"
-                all_rule = f"/{child_folder_path}/**"
-
-                if open_rule not in emitted:
-                    lines.append(open_rule)
-                    emitted.add(open_rule)
-                if all_rule not in emitted:
-                    lines.append(all_rule)
-                    emitted.add(all_rule)
-                continue
-
-            self.emit_folder_reignore_rules(child_folder_path, lines, emitted)
+        lines = ["# Ignore everything by default", "/*", ""]
+        def emit(parent: str | None) -> None:
+            for path in sorted(self.folders, key=str.casefold):
+                folder = self.folders[path]
+                if self.parent_folder(path) != parent or not folder.opened:
+                    continue
+                escaped = literal(path)
+                lines.append(f"!/{escaped}/")
+                if folder.declared_fully_safe:
+                    lines.append(f"!/{escaped}/**")
+                else:
+                    lines.append(f"/{escaped}/*")
+                    emit(path)
+            for path in sorted(self.files, key=str.casefold):
+                if self.parent_folder(path) == parent and self.files[path].safe:
+                    lines.append(f"!/{literal(path)}")
+        emit(None)
+        return lines
 
     def parent_folder(self, path_str: str) -> Optional[str]:
         path = PurePosixPath(path_str)
